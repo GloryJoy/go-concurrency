@@ -2,11 +2,14 @@ package main
 
 import (
 	"database/sql"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/alexedwards/scs/redisstore"
@@ -15,6 +18,7 @@ import (
 	_ "github.com/jackc/pgconn"
 	_ "github.com/jackc/pgx/v4"
 	_ "github.com/jackc/pgx/v4/stdlib"
+	"joyful.go/go-concurrency/final/cmd/data"
 )
 
 const webPort = "8080"
@@ -39,14 +43,46 @@ func main() {
 		Wait:     &wg,
 		InfoLog:  infoLog,
 		ErrorLog: errorLog,
+		Models:   data.New(db),
 	}
 	//set up mail
+	app.Mailer = app.createMail()
+	go app.listenForMail()
+
 	//listen for web connection
 	app.serve()
+
+	// listen for signals
+	app.listenForShutdown()
+
+}
+
+func (app *Config) createMail() Mail {
+
+	errorChan := make(chan error)
+	mailerChan := make(chan Message, 100)
+
+	mailerDone := make(chan bool)
+
+	m := Mail{
+		Domain:      "localhost",
+		Host:        "localhost",
+		Port:        1025,
+		Encrption:   "none",
+		FromAddress: "info@mycompany.com",
+		FromName:    "info",
+		ErrChan:     errorChan,
+		Wait:        app.Wait,
+		MailerChan:  mailerChan,
+		DoneChan:    mailerDone,
+	}
+	return m
 
 }
 
 func initSession() *scs.SessionManager {
+
+	gob.Register(data.User{})
 	session := scs.New()
 	session.Store = redisstore.New(initRedis())
 	session.Lifetime = 24 * time.Hour
@@ -67,6 +103,26 @@ func initRedis() *redis.Pool {
 		},
 	}
 	return redisPool
+}
+
+func (app *Config) listenForShutdown() {
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	app.shutdown()
+	os.Exit(0)
+}
+
+func (app *Config) shutdown() {
+	// perform any clean up
+	app.InfoLog.Println("cleaning up...")
+	// block until waitgroup is empty
+	app.Wait.Wait()
+	app.Mailer.DoneChan <- true
+	app.InfoLog.Println("closing channels and shutting down application...")
+	close(app.Mailer.MailerChan)
+	close(app.Mailer.ErrChan)
+	close(app.Mailer.DoneChan)
 }
 
 func (app *Config) serve() {
